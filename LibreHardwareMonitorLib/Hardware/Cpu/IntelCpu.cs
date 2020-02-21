@@ -477,18 +477,18 @@ namespace LibreHardwareMonitor.Hardware.CPU
 
                             L1CacheLoadBandwidth[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L1D Load Bandwidth", coreIdx, threadIdx),
                                                                          sensorIdx * 3,
-                                                                         SensorType.Data,
+                                                                         SensorType.Throughput,
                                                                          this,
                                                                          settings);
 
                             L2CacheLoadBandwidth[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L2 Load Bandwidth", coreIdx, threadIdx),
                                                                          sensorIdx * 3 + 1,
-                                                                         SensorType.Data,
+                                                                         SensorType.Throughput,
                                                                          this,
                                                                          settings);
                             L3CacheLoadBandwidth[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L3 Load Bandwidth", coreIdx, threadIdx),
                                                                          sensorIdx * 3 + 2,
-                                                                         SensorType.Data,
+                                                                         SensorType.Throughput,
                                                                          this,
                                                                          settings);
                             L1DHitRate[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L1D Hitrate", coreIdx, threadIdx),
@@ -547,9 +547,9 @@ namespace LibreHardwareMonitor.Hardware.CPU
 
                 if (pmcsInitialized)
                 {
-                    totalL1CacheLoadBandwidth = new Sensor("Total L1D Load Bandwidth", threadCount * 3, SensorType.Data, this, settings);
-                    totalL2CacheLoadBandwidth = new Sensor("Total L2 Load Bandwidth", threadCount * 3 + 1, SensorType.Data, this, settings);
-                    totalL3CacheLoadBandwidth = new Sensor("Total L3 Load Bandwidth", threadCount * 3 + 2, SensorType.Data, this, settings);
+                    totalL1CacheLoadBandwidth = new Sensor("Total L1D Load Bandwidth", threadCount * 3, SensorType.Throughput, this, settings);
+                    totalL2CacheLoadBandwidth = new Sensor("Total L2 Load Bandwidth", threadCount * 3 + 1, SensorType.Throughput, this, settings);
+                    totalL3CacheLoadBandwidth = new Sensor("Total L3 Load Bandwidth", threadCount * 3 + 2, SensorType.Throughput, this, settings);
                     averageL1DHitRate = new Sensor("Average L1D Hitrate", 0, SensorType.Level, this, settings);
 
                     ActivateSensor(totalL1CacheLoadBandwidth);
@@ -785,9 +785,9 @@ namespace LibreHardwareMonitor.Hardware.CPU
 
                             // L1D calculation only applies to SKL client, which does 32B loads from the L1 data cache
                             // SKL-X does 64B loads, so this will be wrong for those chips. Rip.
-                            L1CacheLoadBandwidth[sensorIdx].Value = (float)((double)L1Hits * 32 / 1000000000);
-                            L2CacheLoadBandwidth[sensorIdx].Value = (float)((double)L2Hits * 64 / 1000000000);
-                            L3CacheLoadBandwidth[sensorIdx].Value = (float)((double)L3Hits * 64 / 1000000000);
+                            L1CacheLoadBandwidth[sensorIdx].Value = L1Hits * 32;
+                            L2CacheLoadBandwidth[sensorIdx].Value = L2Hits * 64;
+                            L3CacheLoadBandwidth[sensorIdx].Value = L3Hits * 64;
                             L1DHitRate[sensorIdx].Value = (float)(100 * (double)L1Hits / loadsRetired);
 
                             totalL1Hits += L1Hits;
@@ -808,9 +808,9 @@ namespace LibreHardwareMonitor.Hardware.CPU
                 {
                     // same caveat as above - SKL-X does 64B loads
                     // if I get around to sandy bridge, that does 16B loads. That'll need another case
-                    totalL1CacheLoadBandwidth.Value = (float)((double)totalL1Hits * 32 / 1000000000);
-                    totalL2CacheLoadBandwidth.Value = (float)((double)totalL2Hits * 64 / 1000000000);
-                    totalL3CacheLoadBandwidth.Value = (float)((double)totalL3Hits * 64 / 1000000000);
+                    totalL1CacheLoadBandwidth.Value = totalL1Hits * 32;
+                    totalL2CacheLoadBandwidth.Value = totalL2Hits * 64;
+                    totalL3CacheLoadBandwidth.Value = totalL3Hits * 64;
                     averageL1DHitRate.Value = (float)(100 * (double)totalL1Hits / totalLoads);
                 }
             }

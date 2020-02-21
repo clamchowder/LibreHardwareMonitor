@@ -561,9 +561,9 @@ namespace LibreHardwareMonitor.Utilities
                 case SensorType.Throughput:
                     return "throughput.png";
                 case SensorType.Counter:
-                    return "throughput.png";
+                    return "data.png";
                 case SensorType.CounterRatio:
-                    return "throughput.png";
+                    return "data.png";
                 default:
                     return "power.png";
             }
