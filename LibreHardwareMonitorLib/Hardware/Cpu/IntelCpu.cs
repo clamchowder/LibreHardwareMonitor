@@ -811,7 +811,7 @@ namespace LibreHardwareMonitor.Hardware.CPU
                     totalL1CacheLoadBandwidth.Value = (float)((double)totalL1Hits * 32 / 1000000000);
                     totalL2CacheLoadBandwidth.Value = (float)((double)totalL2Hits * 64 / 1000000000);
                     totalL3CacheLoadBandwidth.Value = (float)((double)totalL3Hits * 64 / 1000000000);
-                    averageL1DHitRate.Value = (float)(100 * (double)totalL1Hits / loadsRetired);
+                    averageL1DHitRate.Value = (float)(100 * (double)totalL1Hits / totalLoads);
                 }
             }
         }
