@@ -29,6 +29,15 @@ namespace LibreHardwareMonitor.Hardware.CPU
         private readonly Sensor[] _powerSensors;
         private readonly double _timeStampCounterMultiplier;
 
+        private readonly Sensor[] retiredInstructions;
+        private readonly Sensor[] unhaltedThreadClocks;
+        private readonly Sensor[] IPC;
+        private readonly Sensor totalRetiredInstructions;
+        private readonly Sensor totalUnhaltedThreadClocks;
+        private readonly Sensor averageIPC;
+
+        private bool pmcsInitialized = false;
+
         public IntelCpu(int processorIndex, CpuId[][] cpuId, ISettings settings) : base(processorIndex, cpuId, settings)
         {
             // set tjMax
@@ -388,6 +397,83 @@ namespace LibreHardwareMonitor.Hardware.CPU
                 }
             }
 
+            // Enable performance counters
+            if (_microArchitecture == MicroArchitecture.SandyBridge ||
+                _microArchitecture == MicroArchitecture.IvyBridge ||
+                _microArchitecture == MicroArchitecture.Haswell ||
+                _microArchitecture == MicroArchitecture.Skylake ||
+                _microArchitecture == MicroArchitecture.KabyLake)
+            {
+                int threadCount = 0;
+                for (int coreIdx = 0; coreIdx < _coreCount; coreIdx++)
+                {
+                    for (int threadIdx = 0; threadIdx < cpuId[coreIdx].Length; threadIdx++)
+                    {
+                        threadCount++;
+                    }
+                }
+
+                retiredInstructions = new Sensor[threadCount];
+                unhaltedThreadClocks = new Sensor[threadCount];
+                IPC = new Sensor[threadCount];
+
+                int sensorIdx = 0;
+                for (int coreIdx = 0; coreIdx < _coreCount; coreIdx++)
+                {
+                    for (int threadIdx = 0; threadIdx < cpuId[coreIdx].Length; threadIdx++)
+                    {
+                        // enable fixed performance counters (3) and programmable counters (4)
+                        ulong enablePMCsValue = 1 |          // enable PMC0
+                                                1UL << 1 |   // enable PMC1
+                                                1UL << 2 |   // enable PMC2
+                                                1UL << 3 |   // enable PMC3
+                                                1UL << 32 |  // enable FixedCtr0 - retired instructions
+                                                1UL << 33 |  // enable FixedCtr1 - unhalted cycles
+                                                1UL << 34;   // enable FixedCtr2 - reference clocks
+                        Ring0.WriteMsr(IA32_PERF_GLOBAL_CTRL, enablePMCsValue, 1UL << cpuId[coreIdx][threadIdx].Thread);
+
+                        // set all three fixed performance counters to count usr+os. Set AnyThread = false, PMI = false
+                        ulong fixedCounterConfigurationValue = 1 |        // enable FixedCtr0 for os (count kernel mode instructions retired)
+                                                               1UL << 1 | // enable FixedCtr0 for usr (count user mode instructions retired)
+                                                               1UL << 4 | // enable FixedCtr1 for os (count kernel mode unhalted thread cycles)
+                                                               1UL << 5 | // enable FixedCtr1 for usr (count user mode unhalted thread cycles)
+                                                               1UL << 8 | // enable FixedCtr2 for os (reference clocks in kernel mode)
+                                                               1UL << 9;  // enable FixedCtr2 for usr (reference clocks in user mode)
+                        Ring0.WriteMsr(IA32_FIXED_CTR_CTRL, fixedCounterConfigurationValue, 1UL << cpuId[coreIdx][threadIdx].Thread);
+
+                        retiredInstructions[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} Instructions", coreIdx, threadIdx),
+                                                                    sensorIdx,
+                                                                    SensorType.Counter,
+                                                                    this, 
+                                                                    settings);
+                        unhaltedThreadClocks[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} Active Cycles", coreIdx, threadIdx),
+                                                                     sensorIdx,
+                                                                     SensorType.Counter,
+                                                                     this,
+                                                                     settings);
+                        IPC[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} IPC", coreIdx, threadIdx),
+                                                    sensorIdx,
+                                                    SensorType.CounterRatio,
+                                                    this,
+                                                    settings);
+
+                        ActivateSensor(retiredInstructions[sensorIdx]);
+                        ActivateSensor(unhaltedThreadClocks[sensorIdx]);
+                        ActivateSensor(IPC[sensorIdx]);
+                        sensorIdx++;
+                    }
+                }
+
+                totalRetiredInstructions = new Sensor("Total Instructions", 0, SensorType.Counter, this, settings);
+                totalUnhaltedThreadClocks = new Sensor("Total Active Thread Cycles", 0, SensorType.Counter, this, settings);
+                averageIPC = new Sensor("Average IPC", 0, SensorType.CounterRatio, this, settings);
+                ActivateSensor(totalRetiredInstructions);
+                ActivateSensor(totalUnhaltedThreadClocks);
+                ActivateSensor(averageIPC);
+
+                pmcsInitialized = true;
+            }
+
             Update();
         }
 
@@ -513,7 +599,7 @@ namespace LibreHardwareMonitor.Hardware.CPU
                                 uint multiplier = eax & 0xff;
                                 _coreClocks[i].Value = (float)(multiplier * newBusClock);
                                 break;
-                            }                                
+                            }
 
                             case MicroArchitecture.SandyBridge:
                             case MicroArchitecture.IvyBridge:
@@ -534,7 +620,7 @@ namespace LibreHardwareMonitor.Hardware.CPU
                                 _coreClocks[i].Value = (float)(multiplier * newBusClock);
                                 break;
                             }
-                                
+
                             default:
                             {
                                 double multiplier = ((eax >> 8) & 0x1f) + 0.5 * ((eax >> 14) & 1);
@@ -580,6 +666,33 @@ namespace LibreHardwareMonitor.Hardware.CPU
                     _lastEnergyConsumed[sensor.Index] = energyConsumed;
                 }
             }
+
+            // read performance monitoring counters
+            if (pmcsInitialized)
+            {
+                ulong totalInstructionCount = 0, totalCycleCount = 0;
+                int sensorIdx = 0;
+                for (int coreIdx = 0; coreIdx < _coreCount; coreIdx++)
+                {
+                    for (int threadIdx = 0; threadIdx < CpuId[coreIdx].Length; threadIdx++)
+                    {
+                        ulong threadInstructions = ReadAndClearMsr(IA32_FIXED_CTR0, 1UL << CpuId[coreIdx][threadIdx].Thread);
+                        ulong threadUnhaltedClocks = ReadAndClearMsr(IA32_FIXED_CTR1, 1UL << CpuId[coreIdx][threadIdx].Thread);
+                        
+                        retiredInstructions[sensorIdx].Value = (float)((double)threadInstructions / 1000000000);
+                        unhaltedThreadClocks[sensorIdx].Value = (float)((double)threadUnhaltedClocks / 1000000000);
+                        IPC[sensorIdx].Value = (float)((double)threadInstructions / threadUnhaltedClocks);
+
+                        totalInstructionCount += threadInstructions;
+                        totalCycleCount += threadUnhaltedClocks;
+                        sensorIdx++;
+                    }
+                }
+
+                totalRetiredInstructions.Value = (float)((double)totalInstructionCount / 1000000000);
+                totalUnhaltedThreadClocks.Value = (float)((double)totalCycleCount / 1000000000);
+                averageIPC.Value = (float)((double)totalInstructionCount / totalCycleCount);
+            }
         }
 
         [SuppressMessage("ReSharper", "IdentifierTypo")]
@@ -619,6 +732,80 @@ namespace LibreHardwareMonitor.Hardware.CPU
         private const uint MSR_PP1_ENERY_STATUS = 0x641;
 
         private const uint MSR_RAPL_POWER_UNIT = 0x606;
+
+        private const uint IA32_PERF_GLOBAL_CTRL = 0x38F;
+        private const uint IA32_FIXED_CTR_CTRL = 0x38D;
+        private const uint IA32_FIXED_CTR0 = 0x309;
+        private const uint IA32_FIXED_CTR1 = 0x30A;
+        private const uint IA32_FIXED_CTR2 = 0x30B;
+        private const uint IA32_PERFEVTSEL0 = 0x186;
+        private const uint IA32_PERFEVTSEL1 = 0x187;
+        private const uint IA32_PERFEVTSEL2 = 0x188;
+        private const uint IA32_PERFEVTSEL3 = 0x189;
+        private const uint IA32_A_PMC0 = 0x4C1;
+        private const uint IA32_A_PMC1 = 0x4C2;
+        private const uint IA32_A_PMC2 = 0x4C3;
+        private const uint IA32_A_PMC3 = 0x4C4;
         // ReSharper restore InconsistentNaming
+
+        /// <summary>
+        /// Generate value to put in IA32_PERFEVTSELx MSR
+        /// for programming PMCs
+        /// </summary>
+        /// <param name="perfEvent">Event selection</param>
+        /// <param name="umask">Umask (more specific condition for event)</param>
+        /// <param name="usr">Count user mode events</param>
+        /// <param name="os">Count kernel mode events</param>
+        /// <param name="edge">Edge detect</param>
+        /// <param name="pc">Pin control (???)</param>
+        /// <param name="interrupt">Trigger interrupt on counter overflow</param>
+        /// <param name="anyThread">Count across all logical processors</param>
+        /// <param name="enable">Enable the counter</param>
+        /// <param name="invert">Invert cmask condition</param>
+        /// <param name="cmask">if not zero, count when increment > cmask</param>
+        /// <returns></returns>
+        private ulong GetPerfEvtSelRegisterValue(byte perfEvent, 
+                                           byte umask, 
+                                           bool usr, 
+                                           bool os, 
+                                           bool edge, 
+                                           bool pc, 
+                                           bool interrupt, 
+                                           bool anyThread, 
+                                           bool enable, 
+                                           bool invert, 
+                                           byte cmask)
+        {
+            ulong value = (ulong)perfEvent |
+                (ulong)umask << 8 |
+                (usr ? 1UL : 0UL) << 16 |
+                (os ? 1UL : 0UL) << 17 |
+                (edge ? 1UL : 0UL) << 18 |
+                (pc ? 1UL : 0UL) << 19 |
+                (interrupt ? 1UL : 0UL) << 20 |
+                (anyThread ? 1UL : 0UL) << 21 |
+                (enable ? 1UL : 0UL) << 22 |
+                (invert ? 1UL : 0UL) << 23 |
+                (ulong)cmask << 24;
+            return value;
+        }
+
+        /// <summary>
+        /// Read, then zero a MSR. 
+        /// Useful for reading performance counters
+        /// </summary>
+        /// <param name="index">MSR index. Be careful</param>
+        /// <param name="threadAffinityMask">thread affinity</param>
+        /// <returns>MSR value</returns>
+        private ulong ReadAndClearMsr(uint index, ulong threadAffinityMask)
+        {
+            ulong value;
+            if (Ring0.ReadMsr(index, out value, threadAffinityMask))
+            {
+                Ring0.WriteMsr(index, 0, threadAffinityMask);
+            }
+
+            return value;
+        }
     }
 }

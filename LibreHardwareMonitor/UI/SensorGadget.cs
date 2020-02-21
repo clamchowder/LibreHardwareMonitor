@@ -606,6 +606,12 @@ namespace LibreHardwareMonitor.UI
                                 case SensorType.Factor:
                                     format = "{0:F3}";
                                     break;
+                                case SensorType.Counter:
+                                    format = "{0:F2} G";
+                                    break;
+                                case SensorType.CounterRatio:
+                                    format = "{0:F2}";
+                                    break;
                             }
 
                             if (sensor.SensorType == SensorType.Temperature && _unitManager.TemperatureUnit == TemperatureUnit.Fahrenheit)

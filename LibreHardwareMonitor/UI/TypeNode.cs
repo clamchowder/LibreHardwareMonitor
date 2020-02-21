@@ -71,6 +71,14 @@ namespace LibreHardwareMonitor.UI
                     Image = Utilities.EmbeddedResources.GetImage("throughput.png");
                     Text = "Throughput";
                     break;
+                case SensorType.Counter:
+                    Image = Utilities.EmbeddedResources.GetImage("throughput.png");
+                    Text = "Performance Monitoring Counter";
+                    break;
+                case SensorType.CounterRatio:
+                    Image = Utilities.EmbeddedResources.GetImage("throughput.png");
+                    Text = "Performance Metrics (ratios)";
+                    break;
             }
 
             NodeAdded += TypeNode_NodeAdded;

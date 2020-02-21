@@ -349,6 +349,26 @@ namespace LibreHardwareMonitor.Hardware
             return result;
         }
 
+        public static bool ReadMsr(uint index, out ulong value)
+        {
+            value = 0;
+            if (_driver == null)
+            {
+                return false;
+            }
+
+            bool result = _driver.DeviceIOControl(Interop.Ring0.IOCTL_OLS_READ_MSR, index, ref value);
+            return result;
+        }
+
+        public static bool ReadMsr(uint index, out ulong value, ulong threadAffinityMask)
+        {
+            ulong mask = ThreadAffinity.Set(threadAffinityMask);
+            bool result = ReadMsr(index, out value);
+            ThreadAffinity.Set(mask);
+            return result;
+        }
+
         public static bool WriteMsr(uint index, uint eax, uint edx)
         {
             if (_driver == null)
@@ -356,6 +376,23 @@ namespace LibreHardwareMonitor.Hardware
 
 
             WriteMsrInput input = new WriteMsrInput { Register = index, Value = ((ulong)edx << 32) | eax };
+            return _driver.DeviceIOControl(Interop.Ring0.IOCTL_OLS_WRITE_MSR, input);
+        }
+
+        public static bool WriteMsr(uint index, ulong value, ulong threadAffinityMask)
+        {
+            ulong mask = ThreadAffinity.Set(threadAffinityMask);
+            bool result = WriteMsr(index, value);
+            ThreadAffinity.Set(mask);
+            return result;
+        }
+
+        public static bool WriteMsr(uint index, ulong value)
+        {
+            if (_driver == null)
+                return false;
+
+            WriteMsrInput input = new WriteMsrInput { Register = index, Value = value };
             return _driver.DeviceIOControl(Interop.Ring0.IOCTL_OLS_WRITE_MSR, input);
         }
 
