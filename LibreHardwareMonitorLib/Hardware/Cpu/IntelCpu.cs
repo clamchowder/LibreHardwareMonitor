@@ -37,15 +37,20 @@ namespace LibreHardwareMonitor.Hardware.CPU
         private readonly Sensor averageIPC;
         private readonly Sensor[] L1CacheLoadBandwidth;
         private readonly Sensor[] L2CacheLoadBandwidth;
-        private readonly Sensor[] L3CacheLoadBandwidth;
         private readonly Sensor[] L1DHitRate;
+        private readonly Sensor[] L2HitRate;
         private readonly Sensor totalL1CacheLoadBandwidth;
         private readonly Sensor totalL2CacheLoadBandwidth;
-        private readonly Sensor totalL3CacheLoadBandwidth;
         private readonly Sensor averageL1DHitRate;
+        private readonly Sensor averageL2HitRate;
+        private readonly Sensor dramReadBandwidth;
+        private readonly Sensor dramWriteBandwidth;
 
         private bool pmuInitialized = false;
         private bool pmcsInitialized = false;
+        private ulong imcBar = 0;
+        private uint lastDramReadsValue = 0;
+        private uint lastDramWritesValue = 0;
 
         public IntelCpu(int processorIndex, CpuId[][] cpuId, ISettings settings) : base(processorIndex, cpuId, settings)
         {
@@ -427,8 +432,8 @@ namespace LibreHardwareMonitor.Hardware.CPU
                 IPC = new Sensor[threadCount];
                 L1CacheLoadBandwidth = new Sensor[threadCount];
                 L2CacheLoadBandwidth = new Sensor[threadCount];
-                L3CacheLoadBandwidth = new Sensor[threadCount];
                 L1DHitRate = new Sensor[threadCount];
+                L2HitRate = new Sensor[threadCount];
 
                 int sensorIdx = 0;
                 for (int coreIdx = 0; coreIdx < _coreCount; coreIdx++)
@@ -455,55 +460,55 @@ namespace LibreHardwareMonitor.Hardware.CPU
                         Ring0.WriteMsr(IA32_FIXED_CTR_CTRL, fixedCounterConfigurationValue, 1UL << cpuId[coreIdx][threadIdx].Thread);
 
                         // program PMCs. Lots of stuff we can measure. For now let's do cache hits for retired instructions
-                        // Events vary between CPU models
-                        if (_microArchitecture == MicroArchitecture.Skylake || _microArchitecture == MicroArchitecture.KabyLake)
+                        // Events vary between CPU models, but the events/umasks are the same between SKL/HSW for retired memory load and L2 cache events
+                        if (_microArchitecture == MicroArchitecture.Skylake || 
+                            _microArchitecture == MicroArchitecture.KabyLake || 
+                            _microArchitecture == MicroArchitecture.Haswell)
                         {
-                            // Set PMC0 to count retired memory load instructions for which at least one uop hit in the L1 data cache (L1D)
+                            // Set PMC0 to count retired memory load instructions or uops for which at least one uop hit in the L1 data cache (L1D)
+                            // Haswell counts uops, Skylake counts instructions. 
                             ulong retiredL1HitLoads = GetPerfEvtSelRegisterValue(0xD1, 0x01, true, true, false, false, false, false, true, false, 0);
                             Ring0.WriteMsr(IA32_PERFEVTSEL0, retiredL1HitLoads, 1UL << cpuId[coreIdx][threadIdx].Thread);
 
-                            // Set PMC1 to count the same for L2 hits
-                            ulong retiredL2HitLoads = GetPerfEvtSelRegisterValue(0xD1, 0x02, true, true, false, false, false, false, true, false, 0);
-                            Ring0.WriteMsr(IA32_PERFEVTSEL1, retiredL2HitLoads, 1UL << cpuId[coreIdx][threadIdx].Thread);
+                            // Set PMC1 to count all memory loads retired. Same difference between HSW and SKL (uops/instrs)
+                            ulong retiredLoads = GetPerfEvtSelRegisterValue(0xD0, 0x81, true, true, false, false, false, false, true, false, 0);
+                            Ring0.WriteMsr(IA32_PERFEVTSEL1, retiredLoads, 1UL << cpuId[coreIdx][threadIdx].Thread);
 
-                            // Set PMC2 to do the same for L3 hits
-                            ulong retiredL3HitLoads = GetPerfEvtSelRegisterValue(0xD1, 0x04, true, true, false, false, false, false, true, false, 0);
-                            Ring0.WriteMsr(IA32_PERFEVTSEL2, retiredL3HitLoads, 1UL << cpuId[coreIdx][threadIdx].Thread);
+                            // Set PMC2 to count L2 misses. Speculative event, includes reads from purged instructions, prefetches, code reads, etc.
+                            ulong speculativeL2Misses = GetPerfEvtSelRegisterValue(0x24, 0x3F, true, true, false, false, false, false, true, false, 0);
+                            Ring0.WriteMsr(IA32_PERFEVTSEL2, speculativeL2Misses, 1UL << cpuId[coreIdx][threadIdx].Thread);
 
-                            // Set PMC3 to count retired loads that hit the fill buffers, meaning a L1D miss is already pending for the required data
-                            // because a previous instruction requested data in the same 64B cache line and also caused a L1D miss.
-                            ulong retiredFBHitLoads = GetPerfEvtSelRegisterValue(0xD1, 0x40, true, true, false, false, false, false, true, false, 0);
-                            Ring0.WriteMsr(IA32_PERFEVTSEL2, retiredFBHitLoads, 1UL << cpuId[coreIdx][threadIdx].Thread);
+                            // Set PMC3 to count L2 requests. Also a speculative event
+                            ulong speculativeL2References = GetPerfEvtSelRegisterValue(0x24, 0xFF, true, true, false, false, false, false, true, false, 0);
+                            Ring0.WriteMsr(IA32_PERFEVTSEL3, speculativeL2References, 1UL << cpuId[coreIdx][threadIdx].Thread);
 
                             L1CacheLoadBandwidth[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L1D Load Bandwidth", coreIdx, threadIdx),
-                                                                         sensorIdx * 3,
+                                                                         sensorIdx * 2,
                                                                          SensorType.Throughput,
                                                                          this,
                                                                          settings);
-
-                            L2CacheLoadBandwidth[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L2 Load Bandwidth", coreIdx, threadIdx),
-                                                                         sensorIdx * 3 + 1,
-                                                                         SensorType.Throughput,
-                                                                         this,
-                                                                         settings);
-                            L3CacheLoadBandwidth[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L3 Load Bandwidth", coreIdx, threadIdx),
-                                                                         sensorIdx * 3 + 2,
+                            L2CacheLoadBandwidth[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L2 Bandwidth", coreIdx, threadIdx),
+                                                                         sensorIdx * 2 + 1,
                                                                          SensorType.Throughput,
                                                                          this,
                                                                          settings);
                             L1DHitRate[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L1D Hitrate", coreIdx, threadIdx),
-                                                               sensorIdx,
+                                                               sensorIdx * 2,
                                                                SensorType.Level,
                                                                this,
                                                                settings);
+                            L2HitRate[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L2 Hitrate", coreIdx, threadIdx),
+                                                              sensorIdx * 2 + 1,
+                                                              SensorType.Level,
+                                                              this,
+                                                              settings);
 
                             ActivateSensor(L1CacheLoadBandwidth[sensorIdx]);
                             ActivateSensor(L2CacheLoadBandwidth[sensorIdx]);
-                            ActivateSensor(L3CacheLoadBandwidth[sensorIdx]);
                             ActivateSensor(L1DHitRate[sensorIdx]);
-
+                            ActivateSensor(L2HitRate[sensorIdx]);
                             pmcsInitialized = true;
-                        }
+                        } 
 
                         // Zero all performance counters, so starting max values are a little less crazy
                         Ring0.WriteMsr(IA32_FIXED_CTR0, 0, 1UL << cpuId[coreIdx][threadIdx].Thread);
@@ -547,18 +552,38 @@ namespace LibreHardwareMonitor.Hardware.CPU
 
                 if (pmcsInitialized)
                 {
-                    totalL1CacheLoadBandwidth = new Sensor("Total L1D Load Bandwidth", threadCount * 3, SensorType.Throughput, this, settings);
-                    totalL2CacheLoadBandwidth = new Sensor("Total L2 Load Bandwidth", threadCount * 3 + 1, SensorType.Throughput, this, settings);
-                    totalL3CacheLoadBandwidth = new Sensor("Total L3 Load Bandwidth", threadCount * 3 + 2, SensorType.Throughput, this, settings);
-                    averageL1DHitRate = new Sensor("Average L1D Hitrate", 0, SensorType.Level, this, settings);
-
+                    totalL1CacheLoadBandwidth = new Sensor("Total L1D Load Bandwidth", threadCount * 2, SensorType.Throughput, this, settings);
+                    totalL2CacheLoadBandwidth = new Sensor("Total L2 Load Bandwidth", threadCount * 2 + 1, SensorType.Throughput, this, settings);
+                    averageL1DHitRate = new Sensor("Average L1D Hitrate", threadCount * 2, SensorType.Level, this, settings);
+                    averageL2HitRate = new Sensor("Average L2 Hitrate", threadCount * 2 + 1, SensorType.Level, this, settings);
                     ActivateSensor(totalL1CacheLoadBandwidth);
                     ActivateSensor(totalL2CacheLoadBandwidth);
-                    ActivateSensor(totalL3CacheLoadBandwidth);
                     ActivateSensor(averageL1DHitRate);
+                    ActivateSensor(averageL2HitRate);
                 }
 
                 pmuInitialized = true;
+
+                // Skylake Client
+                if (_model == 0x5E)
+                {
+                    // "To obtain the BAR address, read the value at Bus 0; Device 0; Function 0; Offset 48H
+                    // and mask with the value 0x0007FFFFF800." Okay...
+                    uint barAddress = Ring0.GetPciAddress(0, 0, 0);
+                    uint barLow, barHigh;
+                    Ring0.ReadPciConfig(barAddress, 0x48, out barLow);
+                    Ring0.ReadPciConfig(barAddress, 0x48 + 4, out barHigh); // not sure if needed
+
+                    // we get 0xfed10001 (0xfed10000 with mask), which is consistent with what others get
+                    imcBar = (barLow | (ulong)barHigh << 32) & 0x0007FFFFF800;
+
+                    dramReadBandwidth = new Sensor("DRAM Read Bandwidth", 0, SensorType.Throughput, this, settings);
+                    dramWriteBandwidth = new Sensor("DRAM Write Bandwidth", 0, SensorType.Throughput, this, settings);
+
+                    // can't figure this out right now
+                    //ActivateSensor(dramReadBandwidth);
+                    //ActivateSensor(dramWriteBandwidth);
+                }
             }
 
             Update();
@@ -757,7 +782,7 @@ namespace LibreHardwareMonitor.Hardware.CPU
             // read performance monitoring counters
             if (pmuInitialized)
             {
-                ulong totalInstructionCount = 0, totalCycleCount = 0, totalL1Hits = 0, totalL2Hits = 0, totalL3Hits = 0, loadsRetired = 0, totalLoads = 0;
+                ulong totalInstructionCount = 0, totalCycleCount = 0, totalL1Hits = 0, totalL2Hits = 0, totalLoads = 0, totalL2Requests = 0;
                 int sensorIdx = 0;
                 for (int coreIdx = 0; coreIdx < _coreCount; coreIdx++)
                 {
@@ -774,25 +799,23 @@ namespace LibreHardwareMonitor.Hardware.CPU
                         totalInstructionCount += threadInstructions;
                         totalCycleCount += threadUnhaltedClocks;
 
-                        if (_microArchitecture == MicroArchitecture.Skylake || _microArchitecture == MicroArchitecture.KabyLake)
+                        if (pmcsInitialized)
                         {
                             ulong L1Hits = ReadAndClearMsr(IA32_A_PMC0, 1UL << CpuId[coreIdx][threadIdx].Thread);
-                            ulong L2Hits = ReadAndClearMsr(IA32_A_PMC1, 1UL << CpuId[coreIdx][threadIdx].Thread);
-                            ulong L3Hits = ReadAndClearMsr(IA32_A_PMC2, 1UL << CpuId[coreIdx][threadIdx].Thread);
-                            ulong FBHits = ReadAndClearMsr(IA32_A_PMC3, 1UL << CpuId[coreIdx][threadIdx].Thread);
-
-                            loadsRetired = L1Hits + L2Hits + L3Hits + FBHits;
+                            ulong loadsRetired = ReadAndClearMsr(IA32_A_PMC1, 1UL << CpuId[coreIdx][threadIdx].Thread);
+                            ulong L2Misses = ReadAndClearMsr(IA32_A_PMC2, 1UL << CpuId[coreIdx][threadIdx].Thread);
+                            ulong L2Requests = ReadAndClearMsr(IA32_A_PMC3, 1UL << CpuId[coreIdx][threadIdx].Thread);
 
                             // L1D calculation only applies to SKL client, which does 32B loads from the L1 data cache
                             // SKL-X does 64B loads, so this will be wrong for those chips. Rip.
                             L1CacheLoadBandwidth[sensorIdx].Value = L1Hits * 32;
-                            L2CacheLoadBandwidth[sensorIdx].Value = L2Hits * 64;
-                            L3CacheLoadBandwidth[sensorIdx].Value = L3Hits * 64;
+                            L2CacheLoadBandwidth[sensorIdx].Value = (L2Requests - L2Misses) * 64;
                             L1DHitRate[sensorIdx].Value = (float)(100 * (double)L1Hits / loadsRetired);
+                            L2HitRate[sensorIdx].Value = (float)(100 * (1 - (double)L2Misses / L2Requests));
 
                             totalL1Hits += L1Hits;
-                            totalL2Hits += L2Hits;
-                            totalL3Hits += L3Hits;
+                            totalL2Hits += L2Requests - L2Misses;
+                            totalL2Requests += L2Requests;
                             totalLoads += loadsRetired;
                         }
 
@@ -810,9 +833,30 @@ namespace LibreHardwareMonitor.Hardware.CPU
                     // if I get around to sandy bridge, that does 16B loads. That'll need another case
                     totalL1CacheLoadBandwidth.Value = totalL1Hits * 32;
                     totalL2CacheLoadBandwidth.Value = totalL2Hits * 64;
-                    totalL3CacheLoadBandwidth.Value = totalL3Hits * 64;
                     averageL1DHitRate.Value = (float)(100 * (double)totalL1Hits / totalLoads);
+                    averageL2HitRate.Value = (float)(100 * (double)totalL2Hits / totalL2Requests);
                 }
+            }
+
+            if (imcBar != 0)
+            {
+                // counters are 32 bits wide
+                uint dramDataReads = 0, dramDataWrites = 0;
+                //uint iaDramRequests = 0;
+                //Ring0.ReadMemory<uint>(imcBar + SKL_DRAM_IA_REQUESTS_OFFSET, ref iaDramRequests);
+                Ring0.ReadMemory<uint>(imcBar + SKL_DRAM_DATA_READS_OFFSET, ref dramDataReads);
+                Ring0.ReadMemory<uint>(imcBar + SKL_DRAM_DATA_WRITES_OFFSET, ref dramDataWrites);
+
+                if (lastDramReadsValue != 0 && lastDramWritesValue != 0)
+                {
+                    ulong dramBytesRead = ((ulong)dramDataReads - lastDramReadsValue) * 64;
+                    ulong dramBytesWriten = ((ulong)dramDataWrites - lastDramWritesValue) * 64;
+                    dramReadBandwidth.Value = dramBytesRead;
+                    dramWriteBandwidth.Value = dramBytesWriten;
+                }
+
+                lastDramReadsValue = dramDataReads;
+                lastDramWritesValue = dramDataWrites;
             }
         }
 
@@ -867,6 +911,13 @@ namespace LibreHardwareMonitor.Hardware.CPU
         private const uint IA32_A_PMC1 = 0x4C2;
         private const uint IA32_A_PMC2 = 0x4C3;
         private const uint IA32_A_PMC3 = 0x4C4;
+
+        // skylake client memory controller specific constants
+        private const uint SKL_DRAM_GT_REQUESTS_OFFSET = 0x5040;
+        private const uint SKL_DRAM_IA_REQUESTS_OFFSET = 0x5044;
+        private const uint SKL_DRAM_IO_REQUESTS_OFFSET = 0x5048;
+        private const uint SKL_DRAM_DATA_READS_OFFSET = 0x5050;
+        private const uint SKL_DRAM_DATA_WRITES_OFFSET = 0x5054;
         // ReSharper restore InconsistentNaming
 
         /// <summary>
