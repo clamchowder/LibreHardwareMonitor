@@ -216,7 +216,7 @@ namespace LibreHardwareMonitor.Interop
         [DllImport(DllName, CallingConvention = CallingConvention.Winapi)]
         internal static extern bool VirtualFree(IntPtr lpAddress, UIntPtr dwSize, MEM dwFreeType);
 
-        [DllImport(DllName, CallingConvention = CallingConvention.Winapi)]
+        [DllImport(DllName, CallingConvention = CallingConvention.Winapi, SetLastError = true)]
         internal static extern bool DeviceIoControl
         (
             SafeFileHandle device,

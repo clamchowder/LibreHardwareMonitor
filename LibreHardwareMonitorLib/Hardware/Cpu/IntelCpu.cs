@@ -45,6 +45,7 @@ namespace LibreHardwareMonitor.Hardware.CPU
         private readonly Sensor averageL2HitRate;
         private readonly Sensor dramReadBandwidth;
         private readonly Sensor dramWriteBandwidth;
+        private readonly Sensor dramBandwidth;
 
         private bool pmuInitialized = false;
         private bool pmcsInitialized = false;
@@ -564,25 +565,37 @@ namespace LibreHardwareMonitor.Hardware.CPU
 
                 pmuInitialized = true;
 
-                // Skylake Client
-                if (_model == 0x5E)
+                // Skylake Client, or Haswell Client have always-running integrated memory controller counters
+                // Sandy Bridge Client does too but I don't have one to play with
+                if (_model == 0x5E || _model == 0x3C)
                 {
                     // "To obtain the BAR address, read the value at Bus 0; Device 0; Function 0; Offset 48H
                     // and mask with the value 0x0007FFFFF800." Okay...
                     uint barAddress = Ring0.GetPciAddress(0, 0, 0);
                     uint barLow, barHigh;
                     Ring0.ReadPciConfig(barAddress, 0x48, out barLow);
-                    Ring0.ReadPciConfig(barAddress, 0x48 + 4, out barHigh); // not sure if needed
+                    Ring0.ReadPciConfig(barAddress, 0x48 + 4, out barHigh); // not sure if needed, always comes out zero
 
                     // we get 0xfed10001 (0xfed10000 with mask), which is consistent with what others get
                     imcBar = (barLow | (ulong)barHigh << 32) & 0x0007FFFFF800;
 
-                    dramReadBandwidth = new Sensor("DRAM Read Bandwidth", 0, SensorType.Throughput, this, settings);
-                    dramWriteBandwidth = new Sensor("DRAM Write Bandwidth", 0, SensorType.Throughput, this, settings);
+                    // On some systems, WinRing0 fails with error 87 (invalid parameter), likely because it wasn't
+                    // compiled with _PHYSICAL_MEMORY_SUPPORT defined. 
+                    uint testDramDataRead = 0;
+                    if (Ring0.ReadMemory<uint>(imcBar + DRAM_DATA_READS_OFFSET, ref testDramDataRead))
+                    {
+                        dramReadBandwidth = new Sensor("DRAM Read Bandwidth", threadCount * 2 + 2, SensorType.Throughput, this, settings);
+                        dramWriteBandwidth = new Sensor("DRAM Write Bandwidth", threadCount * 2 + 3, SensorType.Throughput, this, settings);
+                        dramBandwidth = new Sensor("Total DRAM Bandwidth", threadCount * 2 + 4, SensorType.Throughput, this, settings);
 
-                    // can't figure this out right now
-                    //ActivateSensor(dramReadBandwidth);
-                    //ActivateSensor(dramWriteBandwidth);
+                        ActivateSensor(dramReadBandwidth);
+                        ActivateSensor(dramWriteBandwidth);
+                        ActivateSensor(dramBandwidth);
+                    }
+                    else
+                    {
+                        imcBar = 0;
+                    }
                 }
             }
 
@@ -842,17 +855,18 @@ namespace LibreHardwareMonitor.Hardware.CPU
             {
                 // counters are 32 bits wide
                 uint dramDataReads = 0, dramDataWrites = 0;
-                //uint iaDramRequests = 0;
-                //Ring0.ReadMemory<uint>(imcBar + SKL_DRAM_IA_REQUESTS_OFFSET, ref iaDramRequests);
-                Ring0.ReadMemory<uint>(imcBar + SKL_DRAM_DATA_READS_OFFSET, ref dramDataReads);
-                Ring0.ReadMemory<uint>(imcBar + SKL_DRAM_DATA_WRITES_OFFSET, ref dramDataWrites);
+                Ring0.ReadMemory<uint>(imcBar + DRAM_DATA_READS_OFFSET, ref dramDataReads);
+                Ring0.ReadMemory<uint>(imcBar + DRAM_DATA_WRITES_OFFSET, ref dramDataWrites);
 
                 if (lastDramReadsValue != 0 && lastDramWritesValue != 0)
                 {
-                    ulong dramBytesRead = ((ulong)dramDataReads - lastDramReadsValue) * 64;
-                    ulong dramBytesWriten = ((ulong)dramDataWrites - lastDramWritesValue) * 64;
+                    // using uint.MaxValue to account for wrapping around seems to result in some overcounting
+                    // prefer undercounting for now
+                    ulong dramBytesRead = (dramDataReads > lastDramReadsValue ? (ulong)dramDataReads - lastDramReadsValue : dramDataReads) * 64;
+                    ulong dramBytesWriten = (dramDataWrites > lastDramWritesValue ? (ulong)dramDataWrites - lastDramWritesValue : dramDataReads) * 64;
                     dramReadBandwidth.Value = dramBytesRead;
                     dramWriteBandwidth.Value = dramBytesWriten;
+                    dramBandwidth.Value = dramBytesRead + dramBytesWriten;
                 }
 
                 lastDramReadsValue = dramDataReads;
@@ -912,12 +926,13 @@ namespace LibreHardwareMonitor.Hardware.CPU
         private const uint IA32_A_PMC2 = 0x4C3;
         private const uint IA32_A_PMC3 = 0x4C4;
 
-        // skylake client memory controller specific constants
-        private const uint SKL_DRAM_GT_REQUESTS_OFFSET = 0x5040;
-        private const uint SKL_DRAM_IA_REQUESTS_OFFSET = 0x5044;
-        private const uint SKL_DRAM_IO_REQUESTS_OFFSET = 0x5048;
-        private const uint SKL_DRAM_DATA_READS_OFFSET = 0x5050;
-        private const uint SKL_DRAM_DATA_WRITES_OFFSET = 0x5054;
+        // sandy bridge and later client platform IMC counter offsets
+        private const uint DRAM_GT_REQUESTS_OFFSET = 0x5040;
+        private const uint DRAM_IA_REQUESTS_OFFSET = 0x5044;
+        private const uint DRAM_IO_REQUESTS_OFFSET = 0x5048;
+        private const uint DRAM_DATA_READS_OFFSET = 0x5050;
+        private const uint DRAM_DATA_WRITES_OFFSET = 0x5054;
+
         // ReSharper restore InconsistentNaming
 
         /// <summary>

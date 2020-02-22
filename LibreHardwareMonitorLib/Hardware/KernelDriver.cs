@@ -17,6 +17,8 @@ namespace LibreHardwareMonitor.Hardware
         private readonly string _id;
         private SafeFileHandle _device;
 
+        public int lastError;
+
         public KernelDriver(string id)
         {
             _id = id;
@@ -131,6 +133,12 @@ namespace LibreHardwareMonitor.Hardware
                                               (uint)Marshal.SizeOf(boxedOutBuffer),
                                               out uint _,
                                               IntPtr.Zero);
+
+            if (!b) 
+            {
+                int error = Marshal.GetLastWin32Error();
+                lastError = error;
+            }
 
             outBuffer = (T)boxedOutBuffer;
             return b;
