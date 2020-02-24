@@ -46,12 +46,19 @@ namespace LibreHardwareMonitor.Hardware.CPU
         private readonly Sensor dramReadBandwidth;
         private readonly Sensor dramWriteBandwidth;
         private readonly Sensor dramBandwidth;
+        private readonly Sensor[] cboxL3Hits;
+        private readonly Sensor[] cboxL3Lookups;
+        private readonly Sensor[] cboxL3Hitrate;
+        private readonly Sensor cboxL3HitBandwidth;
+        private readonly Sensor averageL3HitRate;
 
         private bool pmuInitialized = false;
         private bool pmcsInitialized = false;
+        private bool uncorePmuInitialized = false;
         private ulong imcBar = 0;
         private uint lastDramReadsValue = 0;
         private uint lastDramWritesValue = 0;
+        private uint cboBankCount = 0;
 
         public IntelCpu(int processorIndex, CpuId[][] cpuId, ISettings settings) : base(processorIndex, cpuId, settings)
         {
@@ -485,23 +492,31 @@ namespace LibreHardwareMonitor.Hardware.CPU
 
                             L1CacheLoadBandwidth[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L1D Load Bandwidth", coreIdx, threadIdx),
                                                                          sensorIdx * 2,
+                                                                         true,
                                                                          SensorType.Throughput,
                                                                          this,
+                                                                         null,
                                                                          settings);
                             L2CacheLoadBandwidth[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L2 Bandwidth", coreIdx, threadIdx),
                                                                          sensorIdx * 2 + 1,
+                                                                         true,
                                                                          SensorType.Throughput,
                                                                          this,
+                                                                         null,
                                                                          settings);
                             L1DHitRate[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L1D Hitrate", coreIdx, threadIdx),
                                                                sensorIdx * 2,
+                                                               true,
                                                                SensorType.Level,
                                                                this,
+                                                               null,
                                                                settings);
                             L2HitRate[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} L2 Hitrate", coreIdx, threadIdx),
                                                               sensorIdx * 2 + 1,
+                                                              true,
                                                               SensorType.Level,
                                                               this,
+                                                              null,
                                                               settings);
 
                             ActivateSensor(L1CacheLoadBandwidth[sensorIdx]);
@@ -522,18 +537,24 @@ namespace LibreHardwareMonitor.Hardware.CPU
 
                         retiredInstructions[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} Instructions", coreIdx, threadIdx),
                                                                     sensorIdx,
+                                                                    true,
                                                                     SensorType.Counter,
                                                                     this, 
+                                                                    null,
                                                                     settings);
                         unhaltedThreadClocks[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} Active Cycles", coreIdx, threadIdx),
                                                                      sensorIdx,
+                                                                     true,
                                                                      SensorType.Counter,
                                                                      this,
+                                                                     null,
                                                                      settings);
                         IPC[sensorIdx] = new Sensor(string.Format("Core {0} Thread {1} IPC", coreIdx, threadIdx),
                                                     sensorIdx,
+                                                    true,
                                                     SensorType.CounterRatio,
                                                     this,
+                                                    null,
                                                     settings);
 
                         ActivateSensor(retiredInstructions[sensorIdx]);
@@ -596,6 +617,80 @@ namespace LibreHardwareMonitor.Hardware.CPU
                     {
                         imcBar = 0;
                     }
+                }
+
+                if (_model == 0x5E)
+                {
+                    // Set up Skylake client uncore counters
+                    // MSR_UNC_PERF_GLOBAL_CTRL bit 29 = enables all uncore counters. The rest deal with PMIs which we don't want
+                    ulong enableSkylakeUncoreCounters = 1UL << 29;
+                    Ring0.WriteMsr(SKL_MSR_UNC_PERF_GLOBAL_CTRL, enableSkylakeUncoreCounters);
+
+                    // MSR_UNC_PERF_FIXED_CTRL bit 22 = enable counting for fixed counter
+                    // Only other non-reserved bit (20) enables overflow propagation. We're gonna read this counter every second so it won't overflow
+                    ulong enableSkylakeFixedCounter = 1UL << 22;
+                    Ring0.WriteMsr(SKL_MSR_UNC_PERF_FIXED_CTRL, enableSkylakeFixedCounter);
+
+                    ulong cboConfig;
+                    Ring0.ReadMsr(SKL_MSR_UNC_CBO_CONFIG, out cboConfig);
+
+                    // bits 0-3 = number of C-Box units with programmable counters
+                    cboBankCount = (uint)(cboConfig & 0xF);
+                    cboxL3Hits = new Sensor[cboBankCount];
+                    cboxL3Lookups = new Sensor[cboBankCount];
+                    cboxL3Hitrate = new Sensor[cboBankCount];
+
+                    for(uint cboIdx = 0; cboIdx < cboBankCount; cboIdx++)
+                    {
+                        uint eventSelect0Msr = SKL_MSR_UNC_CBO_PERFEVTSEL0_base + (cboIdx * SKL_MSR_UNC_CBO_offset);
+                        uint eventSelect1Msr = SKL_MSR_UNC_CBO_PERFEVTSEL1_base + (cboIdx * SKL_MSR_UNC_CBO_offset);
+                        uint cboxCounter0Msr = SKL_MSR_UNC_CBO_PERFCTR0_base + (cboIdx * SKL_MSR_UNC_CBO_offset);
+                        uint cboxCounter1Msr = SKL_MSR_UNC_CBO_PERFCTR1_base + (cboIdx * SKL_MSR_UNC_CBO_offset);
+
+                        // counter 0: count L3 hits that don't require a line to be forwarded from another core
+                        // 0x34 = cache lookup, 0x87 umask = line found in M, E, or S state.
+                        // not actually listed in uncore performance monitoring doc, but 0x86 is ANY_ES and 0x81 is ANY_M so...
+                        ulong event0Selection = GetCboPerfEvtSelRegisterValue(0x34, 0x86, false, false, true, false, 0);
+                        Ring0.WriteMsr(eventSelect0Msr, event0Selection);
+                        Ring0.WriteMsr(cboxCounter0Msr, 0);
+
+                        // counter1: count all L3 lookups
+                        // 0x34 = cache lookup, 0x8F umask = line found in MESI state (aka any state)
+                        ulong event1Selection = GetCboPerfEvtSelRegisterValue(0x34, 0x8F, false, false, true, false, 0);
+                        Ring0.WriteMsr(eventSelect1Msr, event1Selection);
+                        Ring0.WriteMsr(cboxCounter1Msr, 0);
+
+                        cboxL3Hits[cboIdx] = new Sensor(string.Format("CBo {0} L3 Hits", cboIdx),
+                                                        (int)(threadCount + cboIdx),
+                                                        true,
+                                                        SensorType.Counter,
+                                                        this,
+                                                        null,
+                                                        settings);
+                        cboxL3Lookups[cboIdx] = new Sensor(string.Format("CBo {0} L3 Lookups", cboIdx),
+                                                        (int)(threadCount + cboIdx),
+                                                        true,
+                                                        SensorType.Counter,
+                                                        this,
+                                                        null,
+                                                        settings);
+                        cboxL3Hitrate[cboIdx] = new Sensor(string.Format("CBo {0} L3 Hitrate", cboIdx),
+                                                                (int)(threadCount + cboIdx),
+                                                                true,
+                                                                SensorType.CounterRatio,
+                                                                this,
+                                                                null,
+                                                                settings);
+                        ActivateSensor(cboxL3Hits[cboIdx]);
+                        ActivateSensor(cboxL3Lookups[cboIdx]);
+                        ActivateSensor(cboxL3Hitrate[cboIdx]);
+                    }
+
+                    cboxL3HitBandwidth = new Sensor("Total CBo L3 Hit Bandwidth", threadCount * 2 + 2, SensorType.Throughput, this, settings);
+                    averageL3HitRate = new Sensor("Average L3 Hitrate", threadCount * 2 + 2, SensorType.Level, this, settings);
+                    ActivateSensor(cboxL3HitBandwidth);
+                    ActivateSensor(averageL3HitRate);
+                    uncorePmuInitialized = true;
                 }
             }
 
@@ -872,6 +967,34 @@ namespace LibreHardwareMonitor.Hardware.CPU
                 lastDramReadsValue = dramDataReads;
                 lastDramWritesValue = dramDataWrites;
             }
+
+            if (uncorePmuInitialized)
+            {
+                ulong uncoreClocks, L3Hits = 0, L3Lookups = 0;
+                Ring0.ReadMsr(SKL_MSR_UNC_PERF_FIXED_CTR, out uncoreClocks);
+                Ring0.WriteMsr(SKL_MSR_UNC_PERF_FIXED_CTR, 0);
+
+                for (uint cboIdx = 0; cboIdx < cboBankCount; cboIdx++)
+                {
+                    ulong cboL3HitCount, cboL3LookupCount;
+                    uint counter0Msr = SKL_MSR_UNC_CBO_PERFCTR0_base + (cboIdx * SKL_MSR_UNC_CBO_offset);
+                    uint counter1Msr = SKL_MSR_UNC_CBO_PERFCTR1_base + (cboIdx * SKL_MSR_UNC_CBO_offset);
+                    Ring0.ReadMsr(counter0Msr, out cboL3HitCount);
+                    Ring0.ReadMsr(counter1Msr, out cboL3LookupCount);
+                    Ring0.WriteMsr(counter0Msr, 0);
+                    Ring0.WriteMsr(counter1Msr, 0);
+
+                    cboxL3Hits[cboIdx].Value = (float)((double)cboL3HitCount / 1000000000);
+                    cboxL3Lookups[cboIdx].Value = (float)((double)cboL3LookupCount / 1000000000);
+                    cboxL3Hitrate[cboIdx].Value = (float)((double)cboL3HitCount / cboL3LookupCount);
+
+                    L3Hits += cboL3HitCount;
+                    L3Lookups += cboL3LookupCount;
+                }
+
+                cboxL3HitBandwidth.Value = L3Hits * 64;
+                averageL3HitRate.Value = (float)(100 * (double)L3Hits / L3Lookups);
+            }
         }
 
         [SuppressMessage("ReSharper", "IdentifierTypo")]
@@ -933,6 +1056,21 @@ namespace LibreHardwareMonitor.Hardware.CPU
         private const uint DRAM_DATA_READS_OFFSET = 0x5050;
         private const uint DRAM_DATA_WRITES_OFFSET = 0x5054;
 
+        // skl client uncore MSRs
+        private const uint SKL_MSR_UNC_PERF_GLOBAL_CTRL = 0xE01;
+        private const uint SKL_MSR_UNC_PERF_FIXED_CTRL = 0x394;
+        private const uint SKL_MSR_UNC_PERF_FIXED_CTR = 0x395;
+        private const uint SKL_MSR_UNC_ARB_PERFCTR0 = 0x3B0;
+        private const uint SKL_MSR_UNC_ARB_PERFCTR1 = 0x3B1;
+        private const uint SKL_MSR_UNC_ARB_PERFEVTSEL0 = 0x3B2;
+        private const uint SKL_MSR_UNC_ARB_PERFEVTSEL1 = 0x3B3;
+        private const uint SKL_MSR_UNC_CBO_CONFIG = 0x396;
+        private const uint SKL_MSR_UNC_CBO_PERFEVTSEL0_base = 0x700;
+        private const uint SKL_MSR_UNC_CBO_PERFEVTSEL1_base = 0x701;
+        private const uint SKL_MSR_UNC_CBO_PERFCTR0_base = 0x706;
+        private const uint SKL_MSR_UNC_CBO_PERFCTR1_base = 0x707;
+        private const uint SKL_MSR_UNC_CBO_offset = 0x10;
+
         // ReSharper restore InconsistentNaming
 
         /// <summary>
@@ -949,8 +1087,8 @@ namespace LibreHardwareMonitor.Hardware.CPU
         /// <param name="anyThread">Count across all logical processors</param>
         /// <param name="enable">Enable the counter</param>
         /// <param name="invert">Invert cmask condition</param>
-        /// <param name="cmask">if not zero, count when increment > cmask</param>
-        /// <returns></returns>
+        /// <param name="cmask">if not zero, count when increment >= cmask</param>
+        /// <returns>Value to put in performance event select register</returns>
         private ulong GetPerfEvtSelRegisterValue(byte perfEvent, 
                                            byte umask, 
                                            bool usr, 
@@ -974,6 +1112,35 @@ namespace LibreHardwareMonitor.Hardware.CPU
                 (enable ? 1UL : 0UL) << 22 |
                 (invert ? 1UL : 0UL) << 23 |
                 (ulong)cmask << 24;
+            return value;
+        }
+
+        /// <summary>
+        /// Generates value to put in uncore coherence box performance event select register
+        /// </summary>
+        /// <param name="perfEvent">Event selection</param>
+        /// <param name="umask">Unit mask</param>
+        /// <param name="edge">Count on event edge</param>
+        /// <param name="interrupt">Indicate overflow via PMI</param>
+        /// <param name="enable">Locally enable counter</param>
+        /// <param name="invert">Invert threshold condition</param>
+        /// <param name="threshold">0 = no threshold comparison. otherwise, if invert = 0, count if increment >= threshold. vice versa if invert = 1</param>
+        /// <returns></returns>
+        private ulong GetCboPerfEvtSelRegisterValue(byte perfEvent, 
+                                                    byte umask,
+                                                    bool edge,
+                                                    bool interrupt,
+                                                    bool enable,
+                                                    bool invert,
+                                                    byte threshold)
+        {
+            ulong value = (ulong)perfEvent |
+                (ulong)umask << 8 |
+                (edge ? 1UL : 0UL) << 18 |
+                (interrupt ? 1UL : 0UL) << 20 |
+                (enable ? 1UL : 0UL) << 22 |
+                (invert ? 1UL : 0UL) << 23 |
+                (ulong)threshold << 24;
             return value;
         }
 
