@@ -34,6 +34,7 @@ namespace LibreHardwareMonitor.Hardware.CPU
         private readonly Sensor[] IPC;
         private readonly Sensor totalRetiredInstructions;
         private readonly Sensor totalUnhaltedThreadClocks;
+        private readonly Sensor uncoreClocks;
         private readonly Sensor averageIPC;
         private readonly Sensor[] L1CacheLoadBandwidth;
         private readonly Sensor[] L2CacheLoadBandwidth;
@@ -51,14 +52,16 @@ namespace LibreHardwareMonitor.Hardware.CPU
         private readonly Sensor[] cboxL3Hitrate;
         private readonly Sensor cboxL3HitBandwidth;
         private readonly Sensor averageL3HitRate;
+        private readonly Sensor averageMemoryLatency;
 
         private bool pmuInitialized = false;
         private bool pmcsInitialized = false;
         private bool uncorePmuInitialized = false;
         private ulong imcBar = 0;
+        private uint cboBankCount = 0;
         private uint lastDramReadsValue = 0;
         private uint lastDramWritesValue = 0;
-        private uint cboBankCount = 0;
+        private ulong lastUncoreClockCount = 0;
 
         public IntelCpu(int processorIndex, CpuId[][] cpuId, ISettings settings) : base(processorIndex, cpuId, settings)
         {
@@ -631,6 +634,17 @@ namespace LibreHardwareMonitor.Hardware.CPU
                     ulong enableSkylakeFixedCounter = 1UL << 22;
                     Ring0.WriteMsr(SKL_MSR_UNC_PERF_FIXED_CTRL, enableSkylakeFixedCounter);
 
+                    // Enable ARB counters and zero them
+                    // Set ARB counter 0 = cycles of outgoing, valid entries
+                    ulong arbEvent0Selection = GetCboPerfEvtSelRegisterValue(0x80, 0x01, false, false, true, false, 0);
+                    Ring0.WriteMsr(SKL_MSR_UNC_ARB_PERFEVTSEL0, arbEvent0Selection);
+                    Ring0.WriteMsr(SKL_MSR_UNC_ARB_PERFCTR0, 0);
+
+                    // Set ARB counter 1 = total number of core outgoing entries allocated
+                    ulong arbEvent1Selection = GetCboPerfEvtSelRegisterValue(0x81, 0x01, false, false, true, false, 0);
+                    Ring0.WriteMsr(SKL_MSR_UNC_ARB_PERFEVTSEL1, arbEvent1Selection);
+                    Ring0.WriteMsr(SKL_MSR_UNC_ARB_PERFCTR1, 0);
+
                     ulong cboConfig;
                     Ring0.ReadMsr(SKL_MSR_UNC_CBO_CONFIG, out cboConfig);
 
@@ -688,8 +702,12 @@ namespace LibreHardwareMonitor.Hardware.CPU
 
                     cboxL3HitBandwidth = new Sensor("Total CBo L3 Hit Bandwidth", threadCount * 2 + 2, SensorType.Throughput, this, settings);
                     averageL3HitRate = new Sensor("Average L3 Hitrate", threadCount * 2 + 2, SensorType.Level, this, settings);
+                    uncoreClocks = new Sensor("Uncore Clocks", 0, SensorType.Counter, this, settings);
+                    averageMemoryLatency = new Sensor("Memory Latency (uncore clocks)", 0, SensorType.CounterRatio, this, settings);
                     ActivateSensor(cboxL3HitBandwidth);
                     ActivateSensor(averageL3HitRate);
+                    ActivateSensor(uncoreClocks);
+                    ActivateSensor(averageMemoryLatency);
                     uncorePmuInitialized = true;
                 }
             }
@@ -970,19 +988,34 @@ namespace LibreHardwareMonitor.Hardware.CPU
 
             if (uncorePmuInitialized)
             {
-                ulong uncoreClocks, L3Hits = 0, L3Lookups = 0;
-                Ring0.ReadMsr(SKL_MSR_UNC_PERF_FIXED_CTR, out uncoreClocks);
-                Ring0.WriteMsr(SKL_MSR_UNC_PERF_FIXED_CTR, 0);
+                ulong L3Hits = 0, L3Lookups = 0;
+
+                // uncore clocks. counter is 48 bits wide and "reserved" bits tend to not be zero
+                ulong uncoreClockCount = ReadAndClearMsr(SKL_MSR_UNC_PERF_FIXED_CTR) & 0x0000FFFFFFFFFFFF;
+
+                // intel manual says "RW" but it's clearly not setting back to zero when I write 0 to it
+                // just deal with increments
+                if (uncoreClockCount > lastUncoreClockCount)
+                {
+                    uncoreClocks.Value = (float)((double)(uncoreClockCount - lastUncoreClockCount) / 1000000000);
+                }
+                else
+                {
+                    uncoreClocks.Value = (float)((double)uncoreClockCount / 1000000000);
+                }
+                
+                lastUncoreClockCount = uncoreClockCount;
+
+                ulong uncoreArbOccupancy = ReadAndClearMsr(SKL_MSR_UNC_ARB_PERFCTR0);
+                ulong uncoreArbRequests = ReadAndClearMsr(SKL_MSR_UNC_ARB_PERFCTR1);
+                averageMemoryLatency.Value = (float)((double)uncoreArbOccupancy / uncoreArbRequests);
 
                 for (uint cboIdx = 0; cboIdx < cboBankCount; cboIdx++)
                 {
-                    ulong cboL3HitCount, cboL3LookupCount;
                     uint counter0Msr = SKL_MSR_UNC_CBO_PERFCTR0_base + (cboIdx * SKL_MSR_UNC_CBO_offset);
                     uint counter1Msr = SKL_MSR_UNC_CBO_PERFCTR1_base + (cboIdx * SKL_MSR_UNC_CBO_offset);
-                    Ring0.ReadMsr(counter0Msr, out cboL3HitCount);
-                    Ring0.ReadMsr(counter1Msr, out cboL3LookupCount);
-                    Ring0.WriteMsr(counter0Msr, 0);
-                    Ring0.WriteMsr(counter1Msr, 0);
+                    ulong cboL3HitCount = ReadAndClearMsr(counter0Msr);
+                    ulong cboL3LookupCount = ReadAndClearMsr(counter1Msr);
 
                     cboxL3Hits[cboIdx].Value = (float)((double)cboL3HitCount / 1000000000);
                     cboxL3Lookups[cboIdx].Value = (float)((double)cboL3LookupCount / 1000000000);
@@ -1117,6 +1150,7 @@ namespace LibreHardwareMonitor.Hardware.CPU
 
         /// <summary>
         /// Generates value to put in uncore coherence box performance event select register
+        /// CBo perf event select register layout also applies to ARB
         /// </summary>
         /// <param name="perfEvent">Event selection</param>
         /// <param name="umask">Unit mask</param>
@@ -1157,6 +1191,23 @@ namespace LibreHardwareMonitor.Hardware.CPU
             if (Ring0.ReadMsr(index, out value, threadAffinityMask))
             {
                 Ring0.WriteMsr(index, 0, threadAffinityMask);
+            }
+
+            return value;
+        }
+
+        /// <summary>
+        /// Read, then zero a MSR.
+        /// Doesn't set thread affinity. Good for uncore counters
+        /// </summary>
+        /// <param name="index">MSR index. Be careful</param>
+        /// <returns>MSR value</returns>
+        private ulong ReadAndClearMsr(uint index)
+        {
+            ulong value;
+            if (Ring0.ReadMsr(index, out value))
+            {
+                Ring0.WriteMsr(index, 0);
             }
 
             return value;
