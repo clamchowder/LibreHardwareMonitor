@@ -53,6 +53,7 @@ namespace LibreHardwareMonitor.Hardware.CPU
         private readonly Sensor cboxL3HitBandwidth;
         private readonly Sensor averageL3HitRate;
         private readonly Sensor averageMemoryLatency;
+        private readonly Sensor averageOutstandingArbRequests;
 
         private bool pmuInitialized = false;
         private bool pmcsInitialized = false;
@@ -704,10 +705,12 @@ namespace LibreHardwareMonitor.Hardware.CPU
                     averageL3HitRate = new Sensor("Average L3 Hitrate", threadCount * 2 + 2, SensorType.Level, this, settings);
                     uncoreClocks = new Sensor("Uncore Clocks", 0, SensorType.Counter, this, settings);
                     averageMemoryLatency = new Sensor("Memory Latency (uncore clocks)", 0, SensorType.CounterRatio, this, settings);
+                    averageOutstandingArbRequests = new Sensor("Average ARB Queue Len", 0, SensorType.CounterRatio, this, settings);
                     ActivateSensor(cboxL3HitBandwidth);
                     ActivateSensor(averageL3HitRate);
                     ActivateSensor(uncoreClocks);
                     ActivateSensor(averageMemoryLatency);
+                    ActivateSensor(averageOutstandingArbRequests);
                     uncorePmuInitialized = true;
                 }
             }
@@ -988,7 +991,7 @@ namespace LibreHardwareMonitor.Hardware.CPU
 
             if (uncorePmuInitialized)
             {
-                ulong L3Hits = 0, L3Lookups = 0;
+                ulong L3Hits = 0, L3Lookups = 0, uncoreClocksElapsed;
 
                 // uncore clocks. counter is 48 bits wide and "reserved" bits tend to not be zero
                 ulong uncoreClockCount = ReadAndClearMsr(SKL_MSR_UNC_PERF_FIXED_CTR) & 0x0000FFFFFFFFFFFF;
@@ -997,18 +1000,21 @@ namespace LibreHardwareMonitor.Hardware.CPU
                 // just deal with increments
                 if (uncoreClockCount > lastUncoreClockCount)
                 {
-                    uncoreClocks.Value = (float)((double)(uncoreClockCount - lastUncoreClockCount) / 1000000000);
+                    uncoreClocksElapsed = uncoreClockCount - lastUncoreClockCount;
                 }
                 else
                 {
-                    uncoreClocks.Value = (float)((double)uncoreClockCount / 1000000000);
+                    uncoreClocksElapsed = uncoreClockCount;
                 }
+
+                uncoreClocks.Value = (float)((double)uncoreClocksElapsed / 1000000000);
                 
                 lastUncoreClockCount = uncoreClockCount;
 
                 ulong uncoreArbOccupancy = ReadAndClearMsr(SKL_MSR_UNC_ARB_PERFCTR0);
                 ulong uncoreArbRequests = ReadAndClearMsr(SKL_MSR_UNC_ARB_PERFCTR1);
                 averageMemoryLatency.Value = (float)((double)uncoreArbOccupancy / uncoreArbRequests);
+                averageOutstandingArbRequests.Value = (float)((double)uncoreArbOccupancy / uncoreClocksElapsed);
 
                 for (uint cboIdx = 0; cboIdx < cboBankCount; cboIdx++)
                 {
