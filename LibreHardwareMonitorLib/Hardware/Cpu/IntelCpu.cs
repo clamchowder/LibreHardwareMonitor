@@ -623,12 +623,16 @@ namespace LibreHardwareMonitor.Hardware.CPU
                     }
                 }
 
-                if (_model == 0x5E)
+                if (_model == 0x5E || _model == 0x8E || _model == 0x9E || _model == 0x3C)
                 {
-                    // Set up Skylake client uncore counters
+                    // Set up Skylake client uncore counters (same on kaby lake and coffee lake)
+                    // Haswell client has one different MSR (uncore perf monitor global control is in a different place)
                     // MSR_UNC_PERF_GLOBAL_CTRL bit 29 = enables all uncore counters. The rest deal with PMIs which we don't want
                     ulong enableSkylakeUncoreCounters = 1UL << 29;
-                    Ring0.WriteMsr(SKL_MSR_UNC_PERF_GLOBAL_CTRL, enableSkylakeUncoreCounters);
+                    if (_model == 0x3C)
+                        Ring0.WriteMsr(HSW_MSR_UNC_PERF_GLOBAL_CTRL, enableSkylakeUncoreCounters);
+                    else
+                        Ring0.WriteMsr(SKL_MSR_UNC_PERF_GLOBAL_CTRL, enableSkylakeUncoreCounters);
 
                     // MSR_UNC_PERF_FIXED_CTRL bit 22 = enable counting for fixed counter
                     // Only other non-reserved bit (20) enables overflow propagation. We're gonna read this counter every second so it won't overflow
@@ -1109,6 +1113,8 @@ namespace LibreHardwareMonitor.Hardware.CPU
         private const uint SKL_MSR_UNC_CBO_PERFCTR0_base = 0x706;
         private const uint SKL_MSR_UNC_CBO_PERFCTR1_base = 0x707;
         private const uint SKL_MSR_UNC_CBO_offset = 0x10;
+
+        private const uint HSW_MSR_UNC_PERF_GLOBAL_CTRL = 0x391;
 
         // ReSharper restore InconsistentNaming
 
